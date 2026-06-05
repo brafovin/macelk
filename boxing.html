@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>BOXING 64 — Ring Fighter</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0404; display: flex; flex-direction: column; align-items: center;
+         justify-content: center; height: 100vh; overflow: hidden; user-select: none; }
+  canvas { display: block; image-rendering: pixelated; border: 2px solid #440000; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+const W = 1280, H = 720;
+const canvas = document.getElementById("c");
+canvas.width = W; canvas.height = H;
+const ctx = canvas.getContext("2d");
+
+// scale to window
+function resize() {
+  const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width  = (W * scale) + "px";
+  canvas.style.height = (H * scale) + "px";
+}
+window.addEventListener("resize", resize); resize();
+
+// ─── Ring geometry ────────────────────────────────────────────────────────────
+const RL = 160, RR = 1120, RT = 160, RB = 580;
+const RCX = (RL + RR) / 2, RCY = (RT + RB) / 2;
+
+// ─── Punch params ─────────────────────────────────────────────────────────────
+const DMG = { jab: 8, cross: 18, body: 12, upper: 20 };
+const BLOCK_RED = 0.25;
+const PUNCH_RANGE = 115;
+const HOLD_THRESH = 0.35; // seconds
+
+// ─── Colours ──────────────────────────────────────────────────────────────────
+const C = {
+  floor: "#d2b482", floorLine: "#b89660",
+  rope: "#c01010", post: "#888",
+  hudBg: "rgba(0,0,0,0.55)",
+  red: "#c81818", darkRed: "#780808",
+  blue: "#1e50c8", darkBlue: "#0a2878",
+  yellow: "#e6c814", green: "#1ea032",
+  white: "#ffffff", gray: "#505050", lightGray: "#a0a0a0",
+  skin: "#e6be8c", gloveRed: "#b41414", gloveBlue: "#1428b4",
+  orange: "#dc8214", darkGray: "#282828",
+  shorts_r: "#c01010", shorts_b: "#0a28b4",
+  blood: "#cc1010"
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Particle
+// ═══════════════════════════════════════════════════════════════════════
+class Particle {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    const a = Math.random() * Math.PI * 2;
+    const s = 2 + Math.random() * 6;
+    this.vx = Math.cos(a) * s;
+    this.vy = Math.sin(a) * s - 2;
+    this.life = 15 + Math.random() * 20 | 0;
+    this.maxLife = this.life;
+    this.r = 2 + Math.random() * 5;
+  }
+  update() { this.x += this.vx; this.y += this.vy; this.vy += 0.35; this.life--; }
+  draw(ctx) {
+    const t = this.life / this.maxLife;
+    ctx.globalAlpha = t;
+    ctx.fillStyle = `rgb(${200 + 55*t|0},${30*t|0},${30*t|0})`;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, Math.max(1, this.r * t), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// HitLabel
+// ═══════════════════════════════════════════════════════════════════════
+class HitLabel {
+  constructor(x, y, text, color = "#cc1010") {
+    this.x = x; this.y = y; this.text = text; this.color = color;
+    this.life = 50; this.maxLife = 50;
+  }
+  update() { this.y -= 0.9; this.life--; }
+  draw(ctx) {
+    const t = this.life / this.maxLife;
+    ctx.globalAlpha = t;
+    ctx.font = `bold ${18 + (1-t)*8|0}px Impact, Arial`;
+    ctx.fillStyle = this.color;
+    ctx.textAlign = "center";
+    ctx.fillText(this.text, this.x, this.y);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Boxer
+// ═══════════════════════════════════════════════════════════════════════
+class Boxer {
+  constructor(x, y, name, scheme, isPlayer) {
+    this.x = x; this.y = y;
+    this.name = name; this.isPlayer = isPlayer; this.scheme = scheme;
+    this.gloveColor = scheme === "red" ? C.gloveRed : C.gloveBlue;
+    this.shortsColor = scheme === "red" ? C.shorts_r : C.shorts_b;
+
+    this.hp = 100; this.maxHp = 100;
+    this.stamina = 100; this.maxStamina = 100;
+    this.vx = 0; this.vy = 0; this.speed = 3.5;
+    this.facing = isPlayer ? 1 : -1;
+
+    this.state = "idle"; // idle moving punching blocking dodging hurt ko
+    this.stateTimer = 0;
+    this.bobPhase = 0;
+
+    this.punchType = null; // jab cross body upper
+    this.punchSide = "left"; // left right
+    this.punchAnim = 0;   // 0..1
+    this.punchHit  = false;
+    this.punchCd   = 0;
+
+    this.blocking = false;
+    this.dodgeDir = 0; this.dodgeTimer = 0;
+
+    this.flashTimer = 0;
+    this.particles = []; this.labels = [];
+  }
+
+  startPunch(type, side) {
+    if (["ko","hurt","blocking"].includes(this.state)) return false;
+    if (this.punchCd > 0) return false;
+    const cost = type === "jab" ? 10 : 20;
+    if (this.stamina < cost) return false;
+    this.stamina -= cost;
+    this.state = "punching";
+    this.punchType = type; this.punchSide = side;
+    this.punchAnim = 0; this.punchHit = false;
+    this.punchCd = type === "jab" ? 0.3 : 0.5;
+    return true;
+  }
+
+  startBlock() { if (!["ko","punching"].includes(this.state)) { this.state="blocking"; this.blocking=true; } }
+  stopBlock()  { this.blocking=false; if(this.state==="blocking") this.state="idle"; }
+
+  dodge(dir) {
+    if (["ko","punching"].includes(this.state)) return;
+    this.state="dodging"; this.dodgeDir=dir; this.dodgeTimer=0.25;
+  }
+
+  takeHit(dmg, type) {
+    if (this.state==="ko") return 0;
+    const actual = Math.round(dmg * (this.blocking ? BLOCK_RED : 1));
+    this.hp = Math.max(0, this.hp - actual);
+    this.flashTimer = 10;
+    if (!this.blocking) { this.state="hurt"; this.stateTimer=0.18; }
+    for (let i=0; i<8; i++) this.particles.push(new Particle(this.x, this.y-80));
+    const labels = { jab:`-${actual}`, cross:`CROSS -${actual}`, body:`BODY -${actual}`, upper:`UPPER! -${actual}` };
+    this.labels.push(new HitLabel(this.x + (Math.random()*40-20), this.y-115,
+      labels[type]||`-${actual}`, this.blocking ? C.orange : C.red));
+    if (this.hp <= 0) this.state = "ko";
+    return actual;
+  }
+
+  punchContactPoint() {
+    const ext = 62;
+    const base = this.punchSide === "left" ? this.x - 28 : this.x + 28;
+    const dir  = this.facing;
+    const body = ["body","upper"].includes(this.punchType);
+    return { x: base + dir * ext * (body ? 0.4 : 1), y: this.y - (body ? 60 : 85) };
+  }
+
+  update(dt) {
+    this.bobPhase += 4 * dt;
+    if (this.punchCd > 0) this.punchCd -= dt;
+
+    if (this.state === "punching") {
+      this.punchAnim += dt * 4;
+      if (this.punchAnim >= 1) { this.state="idle"; this.punchAnim=0; this.punchHit=false; }
+    }
+    if (this.state === "dodging") {
+      this.dodgeTimer -= dt;
+      this.x += this.dodgeDir * 175 * dt;
+      if (this.dodgeTimer <= 0) this.state = "idle";
+    }
+    if (this.state === "hurt") {
+      this.stateTimer -= dt;
+      if (this.stateTimer <= 0) this.state = "idle";
+    }
+    if (["idle","moving"].includes(this.state)) {
+      this.x += this.vx; this.y += this.vy;
+      this.state = (Math.abs(this.vx)+Math.abs(this.vy) > 0.1) ? "moving" : "idle";
+    }
+    this.x = Math.max(RL+30, Math.min(RR-30, this.x));
+    this.y = Math.max(RT+30, Math.min(RB-20, this.y));
+
+    if (this.state !== "punching") this.stamina = Math.min(this.maxStamina, this.stamina + 12*dt);
+
+    if (this.flashTimer > 0) this.flashTimer--;
+    this.particles = this.particles.filter(p => { p.update(); return p.life > 0; });
+    this.labels    = this.labels.filter(l => { l.update(); return l.life > 0; });
+  }
+
+  draw(ctx) {
+    const bob = Math.sin(this.bobPhase) * 3;
+    const cx = this.x, cy = this.y + bob;
+
+    if (this.state === "ko") {
+      this._drawKO(ctx, cx, cy);
+    } else {
+      this._drawStand(ctx, cx, cy);
+    }
+
+    if (this.flashTimer > 0) {
+      ctx.globalAlpha = this.flashTimer / 10 * 0.5;
+      ctx.fillStyle = "#ff3030";
+      ctx.fillRect(cx-30, cy-125, 60, 125);
+      ctx.globalAlpha = 1;
+    }
+
+    this.particles.forEach(p => p.draw(ctx));
+    ctx.textAlign = "center";
+    this.labels.forEach(l => l.draw(ctx));
+  }
+
+  _drawStand(ctx, cx, cy) {
+    const gc = this.gloveColor;
+    const sk = C.skin;
+    const hgColor = this.scheme === "red" ? C.red : C.blue;
+
+    // punch extension
+    let ext = 0;
+    if (this.state === "punching") {
+      const t = this.punchAnim;
+      ext = t < 0.5 ? (t/0.5)*52 : ((1-t)/0.5)*52;
+    }
+    const isBody = ["body","upper"].includes(this.punchType) && this.state==="punching";
+
+    // legs
+    ctx.fillStyle = C.darkGray;
+    _rr(ctx, cx-18, cy-10, 14, 30, 4);
+    _rr(ctx, cx+4,  cy-10, 14, 30, 4);
+    // shorts
+    ctx.fillStyle = this.shortsColor;
+    _rr(ctx, cx-20, cy-40, 40, 32, 6);
+    // torso
+    ctx.fillStyle = sk;
+    _rr(ctx, cx-18, cy-85, 36, 48, 8);
+    // head
+    ctx.fillStyle = sk;
+    ctx.beginPath(); ctx.arc(cx, cy-98, 20, 0, Math.PI*2); ctx.fill();
+    // headgear
+    ctx.fillStyle = hgColor;
+    ctx.beginPath();
+    ctx.arc(cx, cy-98, 22, Math.PI, 2*Math.PI);
+    ctx.fill();
+    ctx.fillRect(cx-22, cy-104, 44, 10);
+    // eyes
+    const edx = 6 * this.facing;
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(cx+edx, cy-100, 4, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = "#000";
+    ctx.beginPath(); ctx.arc(cx+edx+this.facing, cy-100, 2, 0, Math.PI*2); ctx.fill();
+
+    if (this.state === "blocking") {
+      // both arms up
+      _arm(ctx, sk, gc, cx-14, cy-70, cx-28, cy-102);
+      _arm(ctx, sk, gc, cx+14, cy-70, cx+28, cy-102);
+    } else {
+      // left arm
+      const isL = this.punchSide==="left" && this.state==="punching";
+      const lx = cx - 28 - (isL && !isBody ? ext * this.facing : 0);
+      const ly = cy - 82 + (isL && isBody ? 20 : 0);
+      _arm(ctx, sk, gc, cx-14, cy-68, lx, ly);
+      // right arm
+      const isR = this.punchSide==="right" && this.state==="punching";
+      const rx = cx + 28 + (isR && !isBody ? ext * this.facing : 0);
+      const ry = cy - 82 + (isR && isBody ? 20 : 0);
+      _arm(ctx, sk, gc, cx+14, cy-68, rx, ry);
+    }
+  }
+
+  _drawKO(ctx, cx, cy) {
+    ctx.fillStyle = C.skin;
+    ctx.beginPath(); ctx.ellipse(cx, cy-12, 42, 20, 0, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = C.darkGray;
+    ctx.beginPath(); ctx.ellipse(cx, cy+4, 32, 16, 0, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = this.gloveColor;
+    ctx.beginPath(); ctx.ellipse(cx-50, cy-5, 18, 12, -0.3, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(cx+50, cy-5, 18, 12, 0.3, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = C.skin;
+    ctx.beginPath(); ctx.arc(cx+5, cy-24, 20, 0, Math.PI*2); ctx.fill();
+    // X eyes
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 2;
+    _x(ctx, cx+10, cy-28, 5);
+  }
+}
+
+function _rr(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, r);
+  ctx.fill();
+}
+function _arm(ctx, skin, gc, x1, y1, x2, y2) {
+  ctx.strokeStyle = skin; ctx.lineWidth = 8; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  ctx.fillStyle = gc;
+  ctx.beginPath(); ctx.arc(x2, y2, 14, 0, Math.PI*2); ctx.fill();
+  // glove highlight
+  ctx.fillStyle = "rgba(255,255,255,0.18)";
+  ctx.beginPath(); ctx.arc(x2-3, y2-4, 7, 0, Math.PI*2); ctx.fill();
+}
+function _x(ctx, cx, cy, s) {
+  ctx.beginPath(); ctx.moveTo(cx-s, cy-s); ctx.lineTo(cx+s, cy+s); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx+s, cy-s); ctx.lineTo(cx-s, cy+s); ctx.stroke();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// AI Controller
+// ═══════════════════════════════════════════════════════════════════════
+class AI {
+  constructor(boxer, target) {
+    this.b = boxer; this.t = target;
+    this.timer = 0.5 + Math.random() * 1.0;
+    this.blockTimer = 0;
+  }
+  update(dt) {
+    const b = this.b, t = this.t;
+    if (b.state === "ko") return;
+    const dx = t.x - b.x, dy = t.y - b.y;
+    const dist = Math.hypot(dx, dy);
+    b.facing = dx > 0 ? 1 : -1;
+
+    if (this.blockTimer > 0) { this.blockTimer -= dt; }
+    else if (b.state === "blocking") { b.stopBlock(); }
+
+    this.timer -= dt;
+    if (this.timer <= 0) {
+      this.timer = 0.4 + Math.random() * 1.0;
+      if (dist < PUNCH_RANGE + 30) {
+        const roll = Math.random();
+        if (roll < 0.15) {
+          b.startBlock(); this.blockTimer = 0.3 + Math.random() * 0.4;
+        } else if (roll < 0.25) {
+          b.dodge(Math.random() < 0.5 ? -1 : 1);
+        } else {
+          const opts = [
+            ["jab","left"],["jab","right"],["cross","left"],["cross","right"],["body","left"],["upper","right"]
+          ];
+          const [type, side] = opts[Math.random()*opts.length|0];
+          b.startPunch(type, side);
+        }
+      }
+    }
+
+    b.vx = 0; b.vy = 0;
+    if (["idle","moving"].includes(b.state)) {
+      if (dist > PUNCH_RANGE - 10) {
+        const spd = b.speed * 0.7;
+        b.vx = (dx/dist) * spd; b.vy = (dy/dist) * spd;
+      } else if (dist < 50) {
+        b.vx = -(dx/dist) * b.speed * 0.5;
+        b.vy = -(dy/dist) * b.speed * 0.5;
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Drawing helpers
+// ═══════════════════════════════════════════════════════════════════════
+function drawRing(ctx) {
+  // background
+  ctx.fillStyle = "#0a0404"; ctx.fillRect(0, 0, W, H);
+
+  // crowd silhouettes
+  ctx.save();
+  for (let x = 0; x < W; x += 28) {
+    const h = 20 + Math.random()*50|0;
+    const g = 15 + Math.random()*40|0;
+    ctx.fillStyle = `rgb(${g},${g/2|0},${g/2|0})`;
+    ctx.beginPath();
+    ctx.ellipse(x+14, H - h/2, 14, h/2, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // floor shadow
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
+  ctx.beginPath(); ctx.ellipse(RCX, RB+10, (RR-RL)/2-20, 35, 0, 0, Math.PI*2); ctx.fill();
+
+  // canvas
+  ctx.fillStyle = C.floor;
+  ctx.fillRect(RL, RT, RR-RL, RB-RT);
+
+  // canvas grid
+  ctx.strokeStyle = C.floorLine; ctx.lineWidth = 1;
+  for (let x = RL+80; x < RR; x+=80) { ctx.beginPath(); ctx.moveTo(x,RT); ctx.lineTo(x,RB); ctx.stroke(); }
+  for (let y = RT+60; y < RB; y+=60) { ctx.beginPath(); ctx.moveTo(RL,y); ctx.lineTo(RR,y); ctx.stroke(); }
+
+  // centre circle
+  ctx.strokeStyle = "#aa8c5a"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(RCX, RCY, 80, 0, Math.PI*2); ctx.stroke();
+
+  // spotlights
+  for (const sx of [RCX-220, RCX, RCX+220]) {
+    const grd = ctx.createRadialGradient(sx, RT, 0, sx, RT, 220);
+    grd.addColorStop(0, "rgba(255,255,180,0.10)");
+    grd.addColorStop(1, "rgba(255,255,180,0)");
+    ctx.fillStyle = grd;
+    ctx.beginPath(); ctx.arc(sx, RT, 220, 0, Math.PI*2); ctx.fill();
+  }
+
+  // posts & ropes
+  const posts = [[RL,RT],[RR,RT],[RL,RB],[RR,RB]];
+  posts.forEach(([px,py]) => {
+    ctx.fillStyle = C.lightGray;
+    ctx.fillRect(px-6, py-60, 12, 60);
+    ctx.fillStyle = C.gray;
+    ctx.fillRect(px-8, py-8, 16, 16);
+  });
+  for (const off of [15,30,45]) {
+    ctx.strokeStyle = C.rope; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(RL, RT-off); ctx.lineTo(RR, RT-off); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(RL, RB+off); ctx.lineTo(RR, RB+off); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(RL-off, RT); ctx.lineTo(RL-off, RB); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(RR+off, RT); ctx.lineTo(RR+off, RB); ctx.stroke();
+  }
+}
+
+function drawHUD(ctx, player, enemy, round, timer) {
+  // player HP
+  ctx.fillStyle = C.darkRed; _rr(ctx, 30, 30, 300, 28, 6);
+  ctx.fillStyle = C.red; _rr(ctx, 30, 30, 300*(player.hp/100), 28, 6);
+  ctx.strokeStyle = C.white; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(30,30,300,28,6); ctx.stroke();
+  ctx.fillStyle = C.white; ctx.font = "bold 18px Impact,Arial"; ctx.textAlign = "left";
+  ctx.fillText(`${player.name}  ${player.hp}HP`, 36, 50);
+
+  // player stamina
+  ctx.fillStyle = "#143c14"; _rr(ctx, 30, 64, 300, 14, 4);
+  ctx.fillStyle = C.green; _rr(ctx, 30, 64, 300*(player.stamina/100), 14, 4);
+
+  // enemy HP
+  ctx.fillStyle = C.darkBlue; _rr(ctx, W-330, 30, 300, 28, 6);
+  const ew = 300*(enemy.hp/100);
+  ctx.fillStyle = C.blue; _rr(ctx, W-330+(300-ew), 30, ew, 28, 6);
+  ctx.strokeStyle = C.white; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(W-330,30,300,28,6); ctx.stroke();
+  ctx.fillStyle = C.white; ctx.font = "bold 18px Impact,Arial"; ctx.textAlign = "right";
+  ctx.fillText(`${enemy.hp}HP  ${enemy.name}`, W-36, 50);
+
+  // enemy stamina
+  ctx.fillStyle = "#143c14"; _rr(ctx, W-330, 64, 300, 14, 4);
+  const esw = 300*(enemy.stamina/100);
+  ctx.fillStyle = C.green; _rr(ctx, W-330+(300-esw), 64, esw, 14, 4);
+
+  // round + timer
+  ctx.fillStyle = C.yellow; ctx.font = "bold 36px Impact,Arial"; ctx.textAlign = "center";
+  ctx.fillText(`RUNDA ${round}`, W/2, 50);
+  const s = Math.max(0, timer|0);
+  ctx.fillStyle = C.white; ctx.font = "22px Impact,Arial";
+  ctx.fillText(`${String(s/60|0).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`, W/2, 76);
+
+  // hint
+  ctx.fillStyle = "#787878"; ctx.font = "14px Impact,Arial";
+  ctx.fillText("WASD=ruch  Q/E=unik  SPACJA=garda  LPM/PPM=jab  (dłużej=cross)  C=upper  R=brzuch", W/2, H-14);
+}
+
+function checkHit(atk, def) {
+  if (atk.state !== "punching" || atk.punchHit) return;
+  if (atk.punchAnim < 0.3 || atk.punchAnim > 0.7) return;
+  const cp = atk.punchContactPoint();
+  const dist = Math.hypot(def.x - cp.x, (def.y-85) - cp.y);
+  if (dist < 52) {
+    atk.punchHit = true;
+    def.takeHit(DMG[atk.punchType], atk.punchType);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// INPUT
+// ═══════════════════════════════════════════════════════════════════════
+const keys = {};
+let lmbDown=false, rmbDown=false, lmbHeld=0, rmbHeld=0;
+
+window.addEventListener("keydown",  e => { keys[e.code] = true;  e.preventDefault(); });
+window.addEventListener("keyup",    e => { keys[e.code] = false; });
+canvas.addEventListener("mousedown", e => {
+  if (e.button===0) { lmbDown=true; lmbHeld=0; }
+  if (e.button===2) { rmbDown=true; rmbHeld=0; }
+  e.preventDefault();
+});
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+canvas.addEventListener("mouseup", e => {
+  if (e.button===0 && lmbDown) {
+    pendingPunch = { side:"left", held: lmbHeld };
+    lmbDown=false; lmbHeld=0;
+  }
+  if (e.button===2 && rmbDown) {
+    pendingPunch = { side:"right", held: rmbHeld };
+    rmbDown=false; rmbHeld=0;
+  }
+  e.preventDefault();
+});
+
+let pendingPunch = null;
+
+// ═══════════════════════════════════════════════════════════════════════
+// SCREENS
+// ═══════════════════════════════════════════════════════════════════════
+let gameState = "menu"; // menu controls game ko result
+let menuSel = 0;
+const menuItems = ["NOWA GRA", "STEROWANIE", "WYJŚCIE"];
+let bgT = 0;
+let resultWinner = "";
+let resultPlayerHp = 0, resultEnemyHp = 0;
+
+let player, enemy, ai;
+let roundNum = 1, roundTimer = 120;
+const MAX_ROUNDS = 3;
+let koFlash = 0;
+let pauseMessage = "";
+let pauseTimer = 0;
+
+function resetGame() {
+  player = new Boxer(RCX-160, RCY+60, "GRACZ", "red",  true);
+  enemy  = new Boxer(RCX+160, RCY+60, "RYWAL", "blue", false);
+  player.facing = 1; enemy.facing = -1;
+  ai = new AI(enemy, player);
+  roundNum = 1; roundTimer = 120; koFlash = 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// UPDATE
+// ═══════════════════════════════════════════════════════════════════════
+let lastTime = 0;
+let prevKeys = {};
+
+function update(ts) {
+  const dt = Math.min((ts - lastTime) / 1000, 0.05);
+  lastTime = ts;
+  bgT += dt;
+
+  // hold timers
+  if (lmbDown) lmbHeld += dt;
+  if (rmbDown) rmbHeld += dt;
+
+  if (gameState === "menu" || gameState === "controls") {
+    drawMenu();
+  } else if (gameState === "game") {
+    updateGame(dt);
+  } else if (gameState === "result") {
+    drawResult();
+  }
+
+  prevKeys = {...keys};
+  requestAnimationFrame(update);
+}
+
+function keyPressed(code) { return keys[code] && !prevKeys[code]; }
+
+// ── menu ─────────────────────────────────────────────────────────────────────
+function drawMenu() {
+  // animated bg
+  ctx.fillStyle = "#080404"; ctx.fillRect(0,0,W,H);
+  for (let x=0; x<W; x+=40) {
+    const a = (Math.abs(Math.sin(bgT*0.7+x*0.03))*55+10)/255;
+    ctx.fillStyle = `rgba(180,20,20,${a})`;
+    ctx.fillRect(x, 0, 2, H);
+  }
+
+  // title
+  ctx.shadowColor = "#cc0000"; ctx.shadowBlur = 30;
+  ctx.fillStyle = "#e6c814"; ctx.font = "bold 80px Impact,Arial"; ctx.textAlign = "center";
+  ctx.fillText("BOXING  64", W/2, 120);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#c81818"; ctx.font = "bold 44px Impact,Arial";
+  ctx.fillText("RING FIGHTER", W/2, 178);
+
+  if (gameState === "controls") {
+    drawControls();
+    return;
+  }
+
+  menuItems.forEach((item, i) => {
+    const sel = i === menuSel;
+    ctx.fillStyle = sel ? C.yellow : C.lightGray;
+    ctx.font = `bold ${sel?48:40}px Impact,Arial`;
+    ctx.fillText((sel?"► ":"  ")+item, W/2, 310+i*90);
+  });
+
+  if (keyPressed("ArrowUp"))   { menuSel = (menuSel-1+menuItems.length)%menuItems.length; }
+  if (keyPressed("ArrowDown")) { menuSel = (menuSel+1)%menuItems.length; }
+  if (keyPressed("Enter") || keyPressed("Space")) {
+    if (menuSel===0) { resetGame(); gameState="game"; }
+    else if (menuSel===1) { gameState="controls"; }
+    else { window.close(); }
+  }
+
+  ctx.fillStyle = C.gray; ctx.font = "16px Impact,Arial";
+  ctx.fillText("v1.0  |  64-bit Ring Fighter", W/2, H-20);
+}
+
+function drawControls() {
+  const rows = [
+    ["W / S / A / D", "Ruch po ringu"],
+    ["Q", "Unik w lewo"],
+    ["E", "Unik w prawo"],
+    ["SPACJA", "Garda (blokuje 75% obrażeń)"],
+    ["LPM (krótko)", "Lewy jab  (8 DMG)"],
+    ["PPM (krótko)", "Prawy jab  (8 DMG)"],
+    ["LPM (dłużej)", "Lewy cross  (18 DMG)"],
+    ["PPM (dłużej)", "Prawy cross  (18 DMG)"],
+    ["C", "Podbródkowy / uppercut  (20 DMG)"],
+    ["R", "Jab w brzuch  (12 DMG)"],
+    ["ESC", "Menu główne"],
+  ];
+  ctx.fillStyle = "rgba(0,0,0,0.7)"; ctx.fillRect(W/2-400, 220, 800, 420);
+  ctx.strokeStyle = C.yellow; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(W/2-400,220,800,420,10); ctx.stroke();
+
+  rows.forEach(([key,desc],i) => {
+    const y = 270 + i*34;
+    ctx.fillStyle = C.yellow; ctx.font = "bold 20px Impact,Arial"; ctx.textAlign = "right";
+    ctx.fillText(key, W/2-20, y);
+    ctx.fillStyle = C.white; ctx.textAlign = "left";
+    ctx.fillText(desc, W/2+20, y);
+  });
+
+  ctx.fillStyle = C.gray; ctx.font = "18px Impact,Arial"; ctx.textAlign = "center";
+  ctx.fillText("[ ESC / ENTER = wróć ]", W/2, H-30);
+
+  if (keyPressed("Escape") || keyPressed("Enter")) gameState="menu";
+}
+
+// ── game ──────────────────────────────────────────────────────────────────────
+function updateGame(dt) {
+  if (keyPressed("Escape")) { gameState="menu"; return; }
+
+  roundTimer -= dt;
+
+  // player movement
+  player.vx = 0; player.vy = 0;
+  if (["idle","moving"].includes(player.state)) {
+    if (keys["KeyA"]) player.vx = -player.speed;
+    if (keys["KeyD"]) player.vx =  player.speed;
+    if (keys["KeyW"]) player.vy = -player.speed;
+    if (keys["KeyS"]) player.vy =  player.speed;
+  }
+
+  // block
+  if (keys["Space"]) player.startBlock();
+  else player.stopBlock();
+
+  // special punches
+  if (keyPressed("KeyC")) player.startPunch("upper","right");
+  if (keyPressed("KeyR")) player.startPunch("body","left");
+  if (keyPressed("KeyQ")) player.dodge(-1);
+  if (keyPressed("KeyE")) player.dodge(1);
+
+  // mouse punch on mouseup (pendingPunch)
+  if (pendingPunch) {
+    const type = pendingPunch.held >= HOLD_THRESH ? "cross" : "jab";
+    player.startPunch(type, pendingPunch.side);
+    pendingPunch = null;
+  }
+
+  player.facing = enemy.x > player.x ? 1 : -1;
+
+  player.update(dt);
+  enemy.update(dt);
+  ai.update(dt);
+
+  checkHit(player, enemy);
+  checkHit(enemy, player);
+
+  // check KO / time
+  if (player.hp <= 0 || enemy.hp <= 0 || roundTimer <= 0) {
+    const byHp = player.hp > enemy.hp;
+    resultWinner = (enemy.hp <= 0 || (roundTimer<=0 && byHp)) ? "PLAYER" : "ENEMY";
+    resultPlayerHp = player.hp; resultEnemyHp = enemy.hp;
+    gameState = "result";
+  }
+
+  // ── draw ─────────────────────────────────────────────────────────────
+  drawRing(ctx);
+  // depth sort
+  const sorted = [player, enemy].sort((a,b) => a.y - b.y);
+  sorted.forEach(b => b.draw(ctx));
+  drawHUD(ctx, player, enemy, roundNum, roundTimer);
+
+  // KO splash
+  if (player.hp <= 0 || enemy.hp <= 0) {
+    ctx.fillStyle = C.yellow;
+    ctx.font = "bold 120px Impact,Arial"; ctx.textAlign = "center";
+    ctx.shadowColor = "#cc0000"; ctx.shadowBlur = 40;
+    ctx.fillText("K.O.!", W/2, H/2+40);
+    ctx.shadowBlur = 0;
+  }
+}
+
+// ── result ────────────────────────────────────────────────────────────────────
+function drawResult() {
+  ctx.fillStyle = "#080404"; ctx.fillRect(0,0,W,H);
+  for (let x=0; x<W; x+=40) {
+    const a = (Math.abs(Math.sin(bgT*0.7+x*0.03))*40+8)/255;
+    ctx.fillStyle = `rgba(180,20,20,${a})`;
+    ctx.fillRect(x, 0, 2, H);
+  }
+
+  const won = resultWinner === "PLAYER";
+  ctx.fillStyle = won ? "#00cc44" : "#cc1010";
+  ctx.font = "bold 90px Impact,Arial"; ctx.textAlign = "center";
+  ctx.shadowColor = won ? "#00ff44" : "#ff1010"; ctx.shadowBlur = 30;
+  ctx.fillText(won ? "WYGRAŁEŚ!" : "PRZEGRAŁEŚ!", W/2, 220);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = C.yellow; ctx.font = "bold 44px Impact,Arial";
+  const reason = Math.min(resultPlayerHp, resultEnemyHp) === 0 ? "NOKAUT!" : "CZAS MINĄŁ";
+  ctx.fillText(reason, W/2, 300);
+
+  ctx.fillStyle = C.white; ctx.font = "28px Impact,Arial";
+  ctx.fillText(`Twoje HP: ${resultPlayerHp}   Rywal HP: ${resultEnemyHp}`, W/2, 370);
+
+  ctx.fillStyle = C.lightGray; ctx.font = "22px Impact,Arial";
+  ctx.fillText("ENTER = Nowa gra    ESC = Menu", W/2, 450);
+
+  if (keyPressed("Enter")) { resetGame(); gameState="game"; }
+  if (keyPressed("Escape")) { gameState="menu"; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// BOOT
+// ═══════════════════════════════════════════════════════════════════════
+requestAnimationFrame(ts => { lastTime = ts; requestAnimationFrame(update); });
+</script>
+</body>
+</html>
